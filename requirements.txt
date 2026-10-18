@@ -1,0 +1,3 @@
+PySide6>=6.6
+watchdog>=4.0
+pynput>=1.7; sys_platform == "win32"
