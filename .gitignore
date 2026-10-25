@@ -221,3 +221,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 /.idea/
+
+# local specification, not published
+SPEC.md

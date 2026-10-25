@@ -1,9 +1,13 @@
-import datetime as dt, glob, os, threading, time
+import datetime as dt, glob, hashlib, os, threading, time
 from .parser import parse_file, parse_bytes, BATTLE_ACTIONS
 from .winread import (
     read_file, ReadError, ReadThrottled, is_admin, last_info, vss_cleanup,
     vss_mark_pending, vss_seconds_until_ready, vss_is_pending,
 )
+
+# These readers can see new bytes while size and mtime stay put (ring buffer, exclusive lock).
+# vss keeps its own trailing-edge retry, so it is not re-read on every poll.
+_REREAD_METHODS = {"dup_handle", "raw_ntfs"}
 
 def _utc(ts):
     """Parse game log timestamp as UTC. Game writes UTC wall-clock (not local)."""
@@ -14,11 +18,12 @@ def _utc(ts):
 
 class Collector:
     """Watches the alilog folder, stores events, calls on_battle(kind, payload)."""
-    def __init__(self, cfg, gd, store, on_battle=None, log=print, on_status=None):
+    def __init__(self, cfg, gd, store, on_battle=None, log=print, on_status=None, allow_elevate=False):
         self.cfg, self.gd, self.store, self.on_battle, self.log = cfg, gd, store, on_battle, log
         self.on_status = on_status; self.status = None; self.read_method = None
+        self.allow_elevate = allow_elevate; self._elev_asked = False
         self.seen = set(r[0] for r in store.db.execute("SELECT key FROM events"))
-        self.files = {}
+        self.files = {}; self._digest = {}; self.methods = {}
         self._stop = threading.Event(); self._wake = threading.Event()
         self._vss_retry_at = 0.0   # monotonic deadline to retry after throttle
         self.observer = None
@@ -96,7 +101,12 @@ class Collector:
             if self.status is None or self.status[0] != "error":
                 self.log("[сборщик] %s: %s" % (os.path.basename(path), det))
             if not is_admin():
-                hint = "запустите run_admin.bat (от имени администратора)"
+                if self.allow_elevate and not self._elev_asked:
+                    self._elev_asked = True
+                    from .winread import relaunch_elevated
+                    if relaunch_elevated():
+                        os._exit(0)
+                hint = "игра держит лог эксклюзивно — подтвердите UAC или запустите run_admin.bat"
             else:
                 hint = "закройте игру — история прочитается после сессии; пришлите вывод diag.bat"
             self.set_status("error", "Нет доступа к логу — %s" % hint)
@@ -104,19 +114,26 @@ class Collector:
         except Exception as e:
             self.log("[сборщик] ошибка чтения %s: %s" % (path, e)); return None
 
+        self.methods[path] = method
         if method != self.read_method:
             self.read_method = method
             self.log("[сборщик] читаю лог способом: %s" % method)
-        try:
-            evs = parse_bytes(data); evs.sort(key=lambda e: (e["ts"] or "", e["pos"]))
-        except Exception as e:
-            self.log("[сборщик] ошибка разбора %s: %s" % (path, e)); return None
-
         lat = last_info().get("latency", {}).get(method)
         if lat is None:
             lat = time.time() - t0
         lat_s = ", %.0f мс" % (lat * 1000)
         self.set_status("ok", "Лог читается (%s%s) · жду подготовку к бою" % (method, lat_s))
+
+        digest = hashlib.sha1(data).digest()
+        if self._digest.get(path) == digest:
+            if method == "vss" and vss_is_pending():
+                self._vss_retry_at = time.monotonic() + vss_seconds_until_ready()
+            return 0
+        try:
+            evs = parse_bytes(data); evs.sort(key=lambda e: (e["ts"] or "", e["pos"]))
+        except Exception as e:
+            self.log("[сборщик] ошибка разбора %s: %s" % (path, e)); return None
+        self._digest[path] = digest
 
         n = 0; prepares = 0
         for ev in evs:
@@ -161,7 +178,7 @@ class Collector:
             except OSError:
                 continue
             sig = (st.st_mtime_ns, st.st_size, getattr(st, "st_ino", 0))
-            if self.files.get(p) == sig:
+            if self.files.get(p) == sig and self.methods.get(p) not in _REREAD_METHODS:
                 continue
             n = self.scan_file(p, live=live)
             if n is None:

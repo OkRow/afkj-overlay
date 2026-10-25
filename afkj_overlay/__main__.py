@@ -41,7 +41,12 @@ def main():
     ap.add_argument("--db", help="путь к SQLite (по умолчанию userdata/afkj.db)")
     ap.add_argument("--delay", type=float, default=0.0, help="пауза между боевыми событиями в --replay --console")
     a = ap.parse_args()
-    cfg = cfgmod.load(); gd = GameData(); store = Store(a.db)
+    cfg = cfgmod.load()
+    if not a.demo and not a.replay:
+        from .winread import elevate_if_log_locked
+        if elevate_if_log_locked(cfg):
+            return
+    gd = GameData(); store = Store(a.db)
 
     if a.console:
         def on_battle(kind, p):
@@ -50,7 +55,7 @@ def main():
                 print(f"\n[{ts} UTC] ПОДГОТОВКА К БОЮ"); print(view_to_text(build_view(gd, store, p["gid"], cfg.get("show_only_owned", True))))
             elif kind == "start": print(f"[{ts} UTC] Бой начался: {p['info']['title']} [{p['gid']}]")
             elif kind == "end": print(f"[{ts} UTC] Конец боя: {p['info']['title']} [{p['gid']}] — {result_line(gd, p)}")
-        col = Collector(cfg, gd, store, on_battle)
+        col = Collector(cfg, gd, store, on_battle, allow_elevate=True)
         if a.demo:
             from .recs import DEMO_GID
             on_battle("prepare", {"gid": DEMO_GID, "info": gd.resolve(DEMO_GID), "ts": "demo", "data": {}})
@@ -64,7 +69,7 @@ def main():
         return
 
     from .ui import run_ui
-    factory = lambda cb: Collector(cfg, gd, store, cb)
+    factory = lambda cb: Collector(cfg, gd, store, cb, allow_elevate=True)
     sys.exit(run_ui(gd, store, cfg, collector_factory=None if a.demo else factory, demo=a.demo, replay=a.replay))
 
 if __name__ == "__main__":

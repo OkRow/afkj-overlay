@@ -35,6 +35,7 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 class TestNoAccess(unittest.TestCase):
+    @unittest.skipUnless(sys.platform != "win32", "на Windows chmod не отбирает чтение; эксклюзивный лог читается через dup_handle")
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read anything")
     def test_status_when_unreadable_then_post_session(self):
         d = tempfile.mkdtemp(); f = os.path.join(d, "log-client-ev10076.dat_000")
