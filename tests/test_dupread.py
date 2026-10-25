@@ -6,7 +6,7 @@ import os, subprocess, sys, tempfile, textwrap, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["AFKJ_NO_ELEVATE"] = "1"
 
-from afkj_overlay.winread import volume_device_path, clear_read_state
+from afkj_overlay.winread import clear_read_state
 
 WIN = sys.platform == "win32"
 
@@ -33,12 +33,6 @@ CHILD = textwrap.dedent(r"""
     open(stop + ".pos", "w").write(str(cur.value))
     k32.CloseHandle(h)
 """)
-
-class TestVolumePath(unittest.TestCase):
-    def test_keeps_colon(self):
-        self.assertEqual(volume_device_path("C:"), "\\\\.\\C:")
-        self.assertEqual(volume_device_path("C:\\"), "\\\\.\\C:")
-        self.assertEqual(volume_device_path("D:"), "\\\\.\\D:")
 
 @unittest.skipUnless(WIN, "Windows handle duplication")
 class TestDupHandle(unittest.TestCase):

@@ -1,13 +1,9 @@
 import datetime as dt, glob, hashlib, os, threading, time
 from .parser import parse_file, parse_bytes, BATTLE_ACTIONS
-from .winread import (
-    read_file, ReadError, ReadThrottled, is_admin, last_info, vss_cleanup,
-    vss_mark_pending, vss_seconds_until_ready, vss_is_pending,
-)
+from .winread import read_file, ReadError, is_admin, last_info
 
-# These readers can see new bytes while size and mtime stay put (ring buffer, exclusive lock).
-# vss keeps its own trailing-edge retry, so it is not re-read on every poll.
-_REREAD_METHODS = {"dup_handle", "raw_ntfs"}
+# dup_handle sees new bytes while size and mtime stay put (ring buffer, exclusive lock).
+_REREAD_METHODS = {"dup_handle"}
 
 def _utc(ts):
     """Parse game log timestamp as UTC. Game writes UTC wall-clock (not local)."""
@@ -25,8 +21,6 @@ class Collector:
         self.seen = set(r[0] for r in store.db.execute("SELECT key FROM events"))
         self.files = {}; self._digest = {}; self.methods = {}
         self._stop = threading.Event(); self._wake = threading.Event()
-        self._vss_retry_at = 0.0   # monotonic deadline to retry after throttle
-        self.observer = None
 
     # ---------- event handling ----------
     def handle(self, ev, src="", live=True, check_age=True):
@@ -67,7 +61,6 @@ class Collector:
                 now = dt.datetime.now(dt.timezone.utc)
                 age = (now - t).total_seconds() if t else 1e9
                 max_age = float(self.cfg.get("live_max_age_sec", 600))
-                # Late discovery grace: VSS can lag ~5–60 s; still show if within max_age.
                 # age is always (now_utc - event_utc); local TZ (e.g. UTC+3) must not affect this.
                 if age > max_age:
                     self.log("[сборщик] пропуск %s age=%.1fs > %ss (ts=%s UTC, now=%s UTC)" % (
@@ -86,16 +79,10 @@ class Collector:
             if self.on_status: self.on_status(level, text)
 
     def scan_file(self, path, live=True):
-        """Returns n_new (int), None on hard error, or 'throttled' if VSS cooldown."""
+        """Returns n_new (int), or None on a hard error."""
         t0 = time.time()
         try:
             data, method = read_file(path, live=live)
-        except ReadThrottled as e:
-            vss_mark_pending()
-            retry = getattr(e, "retry_after", None) or vss_seconds_until_ready()
-            self._vss_retry_at = time.monotonic() + max(0.1, float(retry))
-            self.log("[сборщик] %s — повтор через %.1fс" % (e, retry))
-            return "throttled"
         except ReadError as e:
             det = "; ".join("%s: %s" % (n, m) for n, m in e.details)
             if self.status is None or self.status[0] != "error":
@@ -126,8 +113,6 @@ class Collector:
 
         digest = hashlib.sha1(data).digest()
         if self._digest.get(path) == digest:
-            if method == "vss" and vss_is_pending():
-                self._vss_retry_at = time.monotonic() + vss_seconds_until_ready()
             return 0
         try:
             evs = parse_bytes(data); evs.sort(key=lambda e: (e["ts"] or "", e["pos"]))
@@ -144,12 +129,6 @@ class Collector:
         self.store.commit()
         self.log("[сборщик] read %s %s: %d байт, %.0f мс, новых %d, подготовок %d" % (
             method, os.path.basename(path), len(data), lat * 1000, n, prepares))
-
-        # Trailing edge: if VSS saw a mid-snapshot change, force another pass after cooldown
-        if method == "vss" and vss_is_pending():
-            self._vss_retry_at = time.monotonic() + vss_seconds_until_ready()
-            self.log("[сборщик] vss: файл изменился во время снимка — повтор через %.1fс" %
-                     vss_seconds_until_ready())
         return n
 
     # ---------- watching ----------
@@ -164,14 +143,6 @@ class Collector:
         if not files:
             self.set_status("warn", "Файл лога пока не создан — запустите игру"); return
 
-        # Trailing-edge: if a VSS retry is due, clear remembered sig so we re-read
-        due = self._vss_retry_at and time.monotonic() >= self._vss_retry_at
-        if due:
-            self._vss_retry_at = 0.0
-            for p in files:
-                self.files.pop(p, None)
-            self.log("[сборщик] vss trailing-edge: повторное чтение")
-
         for p in files:
             try:
                 st = os.stat(p)
@@ -183,29 +154,11 @@ class Collector:
             n = self.scan_file(p, live=live)
             if n is None:
                 continue                      # hard error — retry next poll (don't lock sig)
-            if n == "throttled":
-                # Do NOT update files[p]: change must be re-tried after cooldown
-                continue
             self.files[p] = sig
-            # If trailing-edge pending after successful vss, drop sig so next due pass re-reads
-            if vss_is_pending():
-                self.files.pop(p, None)
 
     def start(self):
-        try: vss_cleanup()
-        except Exception: pass
         d = self.log_dir()
         self.log("[сборщик] папка логов: %s" % (d or "НЕ НАЙДЕНА (укажите log_dir в config.json)"))
-        try:
-            from watchdog.observers import Observer
-            from watchdog.events import FileSystemEventHandler
-            wake = self._wake
-            class H(FileSystemEventHandler):
-                def on_any_event(self, e): wake.set()
-            if d and os.path.isdir(d):
-                self.observer = Observer(); self.observer.schedule(H(), d, recursive=False); self.observer.start()
-        except Exception as e:
-            self.log("[сборщик] watchdog недоступен (%s), только опрос" % e)
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
@@ -215,11 +168,7 @@ class Collector:
         except Exception as e:
             self.log("[сборщик] ошибка начального чтения: %s" % e)
         while not self._stop.is_set():
-            # Wake earlier if a VSS trailing-edge retry is scheduled
-            wait = iv
-            if self._vss_retry_at:
-                wait = min(wait, max(0.05, self._vss_retry_at - time.monotonic()))
-            self._wake.wait(wait); self._wake.clear()
+            self._wake.wait(iv); self._wake.clear()
             try:
                 if not self.log_dir() or not os.path.isdir(self.log_dir()):
                     from .config import autodetect_log_dir
@@ -230,12 +179,7 @@ class Collector:
                 self.log("[сборщик] ошибка: %s" % e)
 
     def stop(self):
-        try: vss_cleanup()
-        except Exception: pass
         self._stop.set(); self._wake.set()
-        if self.observer:
-            try: self.observer.stop()
-            except Exception: pass
 
     def replay(self, path, delay=0.0):
         evs = parse_file(path)
