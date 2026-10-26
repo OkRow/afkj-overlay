@@ -25,9 +25,11 @@ class Overlay(QWidget):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.gd, self.store, self.cfg = gd, store, cfg
         self.setObjectName("panel"); self.setAttribute(Qt.WA_TranslucentBackground); self.setStyleSheet(CSS)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowOpacity(float(cfg.get("opacity", 0.92)))
         self.only_owned = bool(cfg.get("show_only_owned", True))
         self.gid = None; self.mini = False; self._drag = None; self._result = ""
+        self._roster_dlg = None; self._roster_opening = False; self._roster_done = None
         self.status = ("warn", "Запуск…")
         f = QFont("Segoe UI" if sys.platform == "win32" else "DejaVu Sans", 10); self.setFont(f)
         lay = QVBoxLayout(self); lay.setContentsMargins(14, 10, 14, 12); lay.setSpacing(6)
@@ -38,6 +40,9 @@ class Overlay(QWidget):
         self.btn_owned.clicked.connect(self._toggle_owned); top.addWidget(self.btn_owned, 0, Qt.AlignTop)
         b = QPushButton("×"); b.setObjectName("close"); b.clicked.connect(self.hide); top.addWidget(b, 0, Qt.AlignTop)
         lay.addLayout(top)
+        self.btn_roster = QPushButton("Мои герои")
+        self.btn_roster.clicked.connect(self.pick_roster)
+        lay.addWidget(self.btn_roster, 0, Qt.AlignLeft)
         self.body = QLabel(); self.body.setTextFormat(Qt.RichText); self.body.setWordWrap(True)
         lay.addWidget(self.body)
         self.foot = QLabel(); self.foot.setTextFormat(Qt.RichText); self.foot.setWordWrap(True)
@@ -59,6 +64,59 @@ class Overlay(QWidget):
             self._drag = None; self.cfg["pos"] = [self.x(), self.y()]; cfgmod.save(self.cfg)
     def mouseDoubleClickEvent(self, e):
         if self.mini: self.set_mini(False)
+
+    def pick_roster(self):
+        # Defer past the mouse handler. exec() here, on this translucent tool window, killed the process.
+        if self._roster_dlg is not None:
+            self._roster_dlg.show(); self._roster_dlg.raise_(); self._roster_dlg.activateWindow()
+            return
+        if self._roster_opening:
+            return
+        self._roster_opening = True
+        QTimer.singleShot(0, self._open_roster)
+
+    def _open_roster(self):
+        from PySide6.QtWidgets import QDialog
+        from .roster_ui import RosterDialog
+        self._roster_opening = False
+        if self._roster_dlg is not None:
+            return
+        try:
+            dlg = RosterDialog(self.gd)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            self.show(); self.raise_()
+            return
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.finished.connect(self._roster_finished)
+        dlg.destroyed.connect(self._roster_destroyed)
+        self._roster_dlg = dlg
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
+
+    def _roster_finished(self, result):
+        from PySide6.QtWidgets import QDialog
+        dlg = self._roster_dlg
+        if result == QDialog.Accepted and self.gid:
+            try:
+                self.show_group(self.gid, keep_result=True)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        if dlg is not None:
+            # Keep the Python wrapper until Qt has deleted the window. Dropping it here double-frees.
+            self._roster_done = dlg
+            self._roster_dlg = None
+            dlg.hide()
+            dlg.deleteLater()
+        if not self.isVisible():
+            self.show()
+        self.raise_(); self.activateWindow()
+
+    def _roster_destroyed(self, *args):
+        self._roster_done = None
+        if self._roster_dlg is not None and not self._roster_dlg.isVisible():
+            self._roster_dlg = None
 
     def _toggle_owned(self):
         self.only_owned = self.btn_owned.isChecked()
@@ -134,7 +192,10 @@ class Overlay(QWidget):
                          + (" · двойной клик — развернуть" if self.mini else "") + "</div>")
 
     def set_mini(self, mini):
-        self.mini = mini; self.body.setVisible(not mini); self.btn_owned.setVisible(not mini)
+        self.mini = mini
+        self.body.setVisible(not mini)
+        self.btn_owned.setVisible(not mini)
+        self.btn_roster.setVisible(not mini)
         self._set_foot(); self.adjustSize(); self.resize(self.width(), self.sizeHint().height())
 
     def on_battle(self, kind, p):
@@ -200,5 +261,12 @@ def run_ui(gd, store, cfg, collector_factory=None, demo=False, replay=None):
         ov.status = ("ok", "Демо-режим (без игры)"); demo_sequence(bridge, gd)
     else:
         ov.toggle()  # small "waiting" panel so the user sees it's alive
+    # The picker is a separate window. Closing it must leave the overlay running.
+    if not demo and not replay and not cfg.get("roster_prompted"):
+        from .roster_ui import prompt_roster
+        prompt_roster(gd, cfg, parent=ov)
+        if not ov.isVisible():
+            ov.show()
+        ov.raise_(); ov.activateWindow()
     app.aboutToQuit.connect(lambda: col.stop() if col else None)
     return app.exec()

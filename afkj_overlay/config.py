@@ -14,6 +14,8 @@ DEFAULTS = {
     # Local TZ (e.g. UTC+3) must not affect this. 600 s covers VSS lag (~5-60 s).
     "live_max_age_sec": 600,
     "hide_on_battle_start": False,
+    # Asked once, on the first windowed launch: mark owned heroes now or later.
+    "roster_prompted": False,
 }
 
 def autodetect_log_dir():
